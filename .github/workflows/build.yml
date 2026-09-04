@@ -1,11 +1,13 @@
-name: Build VocalStudioPro
+name: Build VocalStudioPro StudioClean
 
 on:
   workflow_dispatch:
+
   push:
     branches:
       - main
       - master
+
     paths:
       - "VocalStudioPro-Native-*-Source-v*.zip"
       - ".github/workflows/build.yml"
@@ -13,27 +15,44 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: vocalstudiopro-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+
   build:
-    name: Build Android APK
+
+    name: Build VocalStudioPro APK
+
     runs-on: ubuntu-latest
 
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       JAVA_VERSION: "17"
-      ANDROID_API_LEVEL: "37"
-      ANDROID_BUILD_TOOLS: "37.0.0"
+
+      # AGP 9.4 default/recommended toolchain
+      GRADLE_VERSION: "9.6.0"
+      BUILD_TOOLS_VERSION: "36.0.0"
+
+      # Native DSP
       NDK_VERSION: "28.2.13676358"
       CMAKE_VERSION: "3.22.1"
 
+      # App
+      APP_VERSION: "1.1.0"
+
     steps:
+
       # ============================================================
-      # 1. Checkout
+      # 1. Checkout repository
       # ============================================================
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       # ============================================================
       # 2. Java 17
@@ -44,94 +63,363 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
       # ============================================================
-      # 3. Android SDK
+      # 3. Android SDK command-line tools
       # ============================================================
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Accept Android SDK licenses
+      # ============================================================
+      # 4. Detect Android 17 / API 37 SDK package
+      #
+      # Android 17 may appear as:
+      #
+      # platforms;android-37
+      # platforms;android-37.0
+      # platforms;android-CinnamonBun
+      #
+      # depending on the repository/channel state.
+      # ============================================================
+
+      - name: Detect Android 17 SDK platform
+        id: android_sdk
         shell: bash
         run: |
           set -Eeuo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
+
+          echo "=================================================="
+          echo "Android SDK Manager"
+          echo "=================================================="
+
+          echo
+          echo "SDK root:"
+          echo "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
+          echo
+          echo "sdkmanager:"
+          command -v sdkmanager
+
+          echo
+          echo "Updating SDK package metadata..."
+
+          sdkmanager --update || true
+
+          echo
+          echo "Accepting SDK licenses..."
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          SDK_LIST="$RUNNER_TEMP/android-sdk-list.txt"
+
+          echo
+          echo "Loading packages from all Android SDK channels..."
+
+          sdkmanager --list --channel=3 \
+            | tr -d '\r' \
+            > "$SDK_LIST"
+
+          echo
+          echo "Possible Android 17 platform packages:"
+          grep -E \
+            'platforms;android-(37([.][0-9]+)?|CinnamonBun)' \
+            "$SDK_LIST" \
+            || true
+
+          echo
+          echo "Possible Build Tools:"
+          grep -E \
+            'build-tools;(36|37)' \
+            "$SDK_LIST" \
+            | head -50 \
+            || true
+
+          # --------------------------------------------------------
+          # First preference:
+          # numeric API 37 package
+          # --------------------------------------------------------
+
+          PLATFORM_PACKAGE="$(
+            awk -F'|' '
+              {
+                pkg=$1
+                gsub(/^[ \t]+/, "", pkg)
+                gsub(/[ \t]+$/, "", pkg)
+
+                if (
+                  pkg == "platforms;android-37" ||
+                  pkg ~ /^platforms;android-37\.[0-9]+$/
+                ) {
+                  print pkg
+                }
+              }
+            ' "$SDK_LIST" \
+            | sort -V \
+            | tail -n1
+          )"
+
+          # --------------------------------------------------------
+          # Preview/codename fallback
+          # --------------------------------------------------------
+
+          if [[ -z "${PLATFORM_PACKAGE:-}" ]]; then
+
+            PLATFORM_PACKAGE="$(
+              awk -F'|' '
+                {
+                  pkg=$1
+                  gsub(/^[ \t]+/, "", pkg)
+                  gsub(/[ \t]+$/, "", pkg)
+
+                  if (pkg == "platforms;android-CinnamonBun") {
+                    print pkg
+                  }
+                }
+              ' "$SDK_LIST" \
+              | head -n1
+            )"
+
+          fi
+
+          # --------------------------------------------------------
+          # Hard failure only when Android 17 is genuinely absent
+          # --------------------------------------------------------
+
+          if [[ -z "${PLATFORM_PACKAGE:-}" ]]; then
+
+            echo
+            echo "::error::Android 17 / API 37 SDK platform was not found."
+
+            echo
+            echo "Available Android platform packages:"
+
+            awk -F'|' '
+              {
+                pkg=$1
+                gsub(/^[ \t]+/, "", pkg)
+                gsub(/[ \t]+$/, "", pkg)
+
+                if (pkg ~ /^platforms;android-/) {
+                  print pkg
+                }
+              }
+            ' "$SDK_LIST" \
+            | sort -V \
+            | uniq \
+            | tail -80
+
+            exit 1
+
+          fi
+
+          echo
+          echo "Selected Android platform:"
+          echo "$PLATFORM_PACKAGE"
+
+          {
+            echo "platform_package=$PLATFORM_PACKAGE"
+          } >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 5. Install Android build dependencies
+      # ============================================================
 
       - name: Install Android build dependencies
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          PLATFORM_PACKAGE="${{ steps.android_sdk.outputs.platform_package }}"
+
+          echo "=================================================="
+          echo "Installing Android build environment"
+          echo "=================================================="
+
+          echo
+          echo "Platform:"
+          echo "$PLATFORM_PACKAGE"
+
+          echo
+          echo "Build Tools:"
+          echo "$BUILD_TOOLS_VERSION"
+
+          echo
+          echo "NDK:"
+          echo "$NDK_VERSION"
+
+          echo
+          echo "CMake:"
+          echo "$CMAKE_VERSION"
+
+          echo
+
           sdkmanager \
+            --channel=3 \
             "platform-tools" \
-            "platforms;android-${ANDROID_API_LEVEL}" \
-            "build-tools;${ANDROID_BUILD_TOOLS}" \
-            "ndk;${NDK_VERSION}" \
-            "cmake;${CMAKE_VERSION}"
+            "$PLATFORM_PACKAGE" \
+            "build-tools;$BUILD_TOOLS_VERSION" \
+            "ndk;$NDK_VERSION" \
+            "cmake;$CMAKE_VERSION"
+
+          echo
+          echo "=================================================="
+          echo "Installed SDK components"
+          echo "=================================================="
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
+          echo
+          echo "Platforms:"
+          find "$SDK_ROOT/platforms" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            -printf '%f\n' \
+            | sort \
+            || true
+
+          echo
+          echo "Build Tools:"
+          find "$SDK_ROOT/build-tools" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            -printf '%f\n' \
+            | sort \
+            || true
+
+          echo
+          echo "NDK:"
+          find "$SDK_ROOT/ndk" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            -printf '%f\n' \
+            | sort \
+            || true
+
+          echo
+          echo "CMake:"
+          find "$SDK_ROOT/cmake" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            -printf '%f\n' \
+            | sort \
+            || true
+
+          # --------------------------------------------------------
+          # Validate required components
+          # --------------------------------------------------------
+
+          test -d "$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
+
+          test -d "$SDK_ROOT/ndk/$NDK_VERSION"
+
+          test -d "$SDK_ROOT/cmake/$CMAKE_VERSION"
+
+          echo
+          echo "Android environment installation PASSED."
 
       # ============================================================
-      # 4. Gradle cache/setup
+      # 6. Setup Gradle 9.6
       # ============================================================
 
-      - name: Setup Gradle
+      - name: Setup Gradle 9.6
         uses: gradle/actions/setup-gradle@v4
         with:
+          gradle-version: "9.6.0"
           cache-read-only: false
 
       # ============================================================
-      # 5. Locate newest VocalStudioPro ZIP
+      # 7. Find newest VocalStudioPro source ZIP
       # ============================================================
 
-      - name: Detect and validate VocalStudioPro source
+      - name: Detect VocalStudioPro source ZIP
         id: source
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "=========================================="
+          echo "=================================================="
           echo "Searching VocalStudioPro source ZIP"
-          echo "=========================================="
+          echo "=================================================="
 
-          zip="$(
-            find "$GITHUB_WORKSPACE" \
-              -maxdepth 1 \
-              -type f \
-              -name 'VocalStudioPro-Native-*-Source-v*.zip' \
-              -print \
+          echo
+          echo "Repository root:"
+          ls -lah "$GITHUB_WORKSPACE"
+
+          # --------------------------------------------------------
+          # Prefer current StudioClean build
+          # --------------------------------------------------------
+
+          preferred="$GITHUB_WORKSPACE/VocalStudioPro-Native-StudioClean-Source-v1.1.0.zip"
+
+          if [[ -s "$preferred" ]]; then
+
+            zip="$preferred"
+
+          else
+
+            # ------------------------------------------------------
+            # Future-compatible fallback:
+            # use newest VocalStudioPro source archive.
+            # ------------------------------------------------------
+
+            zip="$(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 1 \
+                -type f \
+                -name 'VocalStudioPro-Native-*-Source-v*.zip' \
+                -print \
               | sort -V \
               | tail -n1
-          )"
+            )"
+
+          fi
 
           if [[ -z "${zip:-}" || ! -s "$zip" ]]; then
-            echo "::error::VocalStudioPro source ZIP not found."
+
+            echo
+            echo "::error::VocalStudioPro source ZIP was not found."
+
             echo
             echo "Repository root contents:"
             ls -lah "$GITHUB_WORKSPACE"
+
             exit 1
+
           fi
 
-          echo "Using ZIP:"
-          echo "$(basename "$zip")"
           echo
+          echo "Selected source ZIP:"
+          echo "$(basename "$zip")"
+
+          echo
+          echo "File size:"
+          ls -lh "$zip"
 
           # --------------------------------------------------------
           # ZIP integrity
           # --------------------------------------------------------
 
+          echo
           echo "Testing ZIP integrity..."
 
           unzip -tq "$zip"
 
-          echo "ZIP integrity: OK"
+          echo "ZIP integrity: PASSED"
 
           # --------------------------------------------------------
-          # Extract
+          # Extract project
           # --------------------------------------------------------
 
-          work="$RUNNER_TEMP/vocalstudiopro"
+          work="$RUNNER_TEMP/vocalstudiopro-source"
 
           rm -rf "$work"
+
           mkdir -p "$work"
 
           echo
@@ -140,7 +428,7 @@ jobs:
           unzip -q "$zip" -d "$work"
 
           # --------------------------------------------------------
-          # Detect project root
+          # Locate settings.gradle.kts
           # --------------------------------------------------------
 
           settings="$(
@@ -152,16 +440,22 @@ jobs:
           )"
 
           if [[ -z "${settings:-}" ]]; then
-            echo "::error::settings.gradle.kts not found."
+
             echo
-            echo "Extracted files:"
+            echo "::error::settings.gradle.kts was not found after extracting the ZIP."
+
+            echo
+            echo "Extracted tree:"
+
             find "$work" \
               -maxdepth 6 \
               -type f \
               -print \
               | sort \
-              | head -300
+              | head -400
+
             exit 1
+
           fi
 
           project="$(dirname "$settings")"
@@ -171,58 +465,99 @@ jobs:
           echo "$project"
 
           # --------------------------------------------------------
-          # Helpers
+          # GitHub output
           # --------------------------------------------------------
 
-          require_file() {
-            local f="$1"
+          {
+            echo "zip=$zip"
+            echo "project=$project"
+          } >> "$GITHUB_OUTPUT"
 
-            if [[ ! -s "$f" ]]; then
-              echo "::error::Required file missing or empty: ${f#$project/}"
+      # ============================================================
+      # 8. Validate project
+      # ============================================================
+
+      - name: Validate Android project
+        id: project_validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          project="${{ steps.source.outputs.project }}"
+
+          echo "=================================================="
+          echo "Validating VocalStudioPro"
+          echo "=================================================="
+
+          require_file() {
+
+            local file="$1"
+
+            if [[ ! -s "$file" ]]; then
+
+              echo
+              echo "::error::Required file missing or empty:"
+              echo "${file#$project/}"
+
               exit 1
+
             fi
 
-            echo "OK file: ${f#$project/}"
+            echo "OK: ${file#$project/}"
+
           }
 
           require_text() {
-            local f="$1"
+
+            local file="$1"
             local text="$2"
             local label="$3"
 
-            if ! grep -Fq -- "$text" "$f"; then
+            if ! grep -Fq -- "$text" "$file"; then
+
               echo
-              echo "::error::$label was not found in ${f#$project/}"
+              echo "::error::$label was not found."
+              echo
+              echo "File:"
+              echo "${file#$project/}"
+              echo
               echo "Expected:"
               echo "$text"
               echo
-              echo "File:"
-              sed -n '1,260p' "$f"
+              echo "Current file:"
+              sed -n '1,300p' "$file"
+
               exit 1
+
             fi
 
             echo "OK: $label"
+
           }
 
-          # --------------------------------------------------------
-          # Required project files
-          # --------------------------------------------------------
+          echo
+          echo "Required files:"
+
+          require_file \
+            "$project/settings.gradle.kts"
+
+          require_file \
+            "$project/build.gradle.kts"
+
+          require_file \
+            "$project/gradle.properties"
+
+          require_file \
+            "$project/app/build.gradle.kts"
+
+          require_file \
+            "$project/app/src/main/AndroidManifest.xml"
+
+          require_file \
+            "$project/app/src/main/cpp/CMakeLists.txt"
 
           echo
-          echo "Checking required files..."
-
-          require_file "$project/settings.gradle.kts"
-          require_file "$project/build.gradle.kts"
-          require_file "$project/app/build.gradle.kts"
-          require_file "$project/app/src/main/AndroidManifest.xml"
-          require_file "$project/app/src/main/cpp/CMakeLists.txt"
-
-          # --------------------------------------------------------
-          # Validate Android project
-          # --------------------------------------------------------
-
-          echo
-          echo "Checking Android configuration..."
+          echo "Android configuration:"
 
           require_text \
             "$project/app/build.gradle.kts" \
@@ -237,123 +572,213 @@ jobs:
           require_text \
             "$project/app/build.gradle.kts" \
             'versionName = "1.1.0"' \
-            'versionName 1.1.0'
-
-          require_text \
-            "$project/app/build.gradle.kts" \
-            'lifecycle-viewmodel-compose:2.12.0' \
-            'Lifecycle ViewModel Compose 2.12.0'
+            'VocalStudioPro version 1.1.0'
 
           require_text \
             "$project/app/build.gradle.kts" \
             'ndkVersion = "28.2.13676358"' \
-            'Android NDK 28.2.13676358'
+            'NDK 28.2.13676358'
 
           # --------------------------------------------------------
-          # Ensure C++ sources exist
+          # Native sources
           # --------------------------------------------------------
+
+          echo
+          echo "Native C/C++ DSP engine:"
 
           cpp_count="$(
             find "$project/app/src/main/cpp" \
               -type f \
-              \( -name '*.cpp' -o -name '*.cc' -o -name '*.c' \) \
+              \( \
+                -name '*.cpp' \
+                -o \
+                -name '*.cc' \
+                -o \
+                -name '*.c' \
+              \) \
               | wc -l
           )"
 
+          header_count="$(
+            find "$project/app/src/main/cpp" \
+              -type f \
+              \( \
+                -name '*.h' \
+                -o \
+                -name '*.hpp' \
+              \) \
+              | wc -l
+          )"
+
+          echo "C/C++ sources: $cpp_count"
+          echo "Headers:       $header_count"
+
           if [[ "$cpp_count" -lt 1 ]]; then
-            echo "::error::No native C/C++ DSP source files found."
+
+            echo
+            echo "::error::No native DSP C/C++ source files were found."
+
             exit 1
-          fi
 
-          echo "OK: Native DSP sources = $cpp_count file(s)"
-
-          # --------------------------------------------------------
-          # Detect Gradle launcher
-          # --------------------------------------------------------
-
-          if [[ -x "$project/gradlew" ]]; then
-            gradle_cmd="./gradlew"
-
-          elif [[ -f "$project/gradlew" ]]; then
-            chmod +x "$project/gradlew"
-            gradle_cmd="./gradlew"
-
-          elif command -v gradle >/dev/null 2>&1; then
-            gradle_cmd="gradle"
-
-          else
-            echo "::error::Neither Gradle Wrapper nor system Gradle found."
-            exit 1
           fi
 
           echo
-          echo "Gradle command: $gradle_cmd"
+          echo "CMakeLists.txt:"
+          sed -n '1,260p' \
+            "$project/app/src/main/cpp/CMakeLists.txt"
 
           # --------------------------------------------------------
-          # Outputs
+          # Gradle launcher
           # --------------------------------------------------------
+
+          echo
+          echo "Gradle launcher:"
+
+          if [[ -f "$project/gradlew" ]]; then
+
+            chmod +x "$project/gradlew"
+
+            gradle_cmd="./gradlew"
+
+            echo "Using project Gradle Wrapper."
+
+          else
+
+            gradle_cmd="gradle"
+
+            echo "Project wrapper not present."
+            echo "Using Gradle $GRADLE_VERSION installed by setup-gradle."
+
+          fi
 
           {
-            echo "project=$project"
-            echo "source_zip=$zip"
             echo "gradle_cmd=$gradle_cmd"
           } >> "$GITHUB_OUTPUT"
 
           echo
-          echo "=========================================="
-          echo "Source validation PASSED"
-          echo "=========================================="
+          echo "=================================================="
+          echo "Project validation PASSED"
+          echo "=================================================="
 
       # ============================================================
-      # 6. Display project info
+      # 9. Print complete build environment
       # ============================================================
 
-      - name: Show project configuration
+      - name: Show build environment
         shell: bash
         working-directory: ${{ steps.source.outputs.project }}
         run: |
           set -Eeuo pipefail
 
-          echo "Project:"
-          pwd
+          echo "=================================================="
+          echo "Build environment"
+          echo "=================================================="
+
+          echo
+          echo "OS:"
+          uname -a
 
           echo
           echo "Java:"
           java -version
 
           echo
-          echo "SDK:"
-          echo "$ANDROID_SDK_ROOT"
+          echo "JAVA_HOME:"
+          echo "$JAVA_HOME"
 
           echo
-          echo "NDK:"
-          echo "$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}"
-
-          echo
-          echo "CMake:"
-          "$ANDROID_SDK_ROOT/cmake/${CMAKE_VERSION}/bin/cmake" --version
+          echo "Android SDK:"
+          echo "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
 
           echo
           echo "Gradle:"
-          ${{ steps.source.outputs.gradle_cmd }} --version
+
+          ${{ steps.project_validation.outputs.gradle_cmd }} \
+            --version
+
+          echo
+          echo "CMake:"
+
+          "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/cmake/${CMAKE_VERSION}/bin/cmake" \
+            --version
+
+          echo
+          echo "NDK:"
+
+          cat \
+            "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/${NDK_VERSION}/source.properties"
 
       # ============================================================
-      # 7. Clean old outputs
+      # 10. Create local.properties explicitly
       # ============================================================
 
-      - name: Clean build
+      - name: Configure Android SDK path
         shell: bash
         working-directory: ${{ steps.source.outputs.project }}
         run: |
           set -Eeuo pipefail
 
-          ${{ steps.source.outputs.gradle_cmd }} \
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
+          {
+            echo "sdk.dir=$SDK_ROOT"
+            echo "ndk.dir=$SDK_ROOT/ndk/$NDK_VERSION"
+          } > local.properties
+
+          echo "Generated local.properties:"
+          cat local.properties
+
+      # ============================================================
+      # 11. Stop any existing Gradle daemons
+      # ============================================================
+
+      - name: Stop Gradle daemons
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project }}
+        run: |
+          set -Eeuo pipefail
+
+          ${{ steps.project_validation.outputs.gradle_cmd }} \
+            --stop \
+            || true
+
+      # ============================================================
+      # 12. Clean
+      # ============================================================
+
+      - name: Clean project
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project }}
+        run: |
+          set -Eeuo pipefail
+
+          ${{ steps.project_validation.outputs.gradle_cmd }} \
             --no-daemon \
             --stacktrace \
+            --warning-mode all \
             clean
 
       # ============================================================
-      # 8. Build Debug
+      # 13. Dependency verification / configuration
+      # ============================================================
+
+      - name: Configure project
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project }}
+        run: |
+          set -Eeuo pipefail
+
+          ${{ steps.project_validation.outputs.gradle_cmd }} \
+            --no-daemon \
+            --stacktrace \
+            --warning-mode all \
+            :app:tasks \
+            > "$RUNNER_TEMP/vocalstudio-gradle-tasks.txt"
+
+          echo "Gradle configuration PASSED."
+
+      # ============================================================
+      # 14. Build Debug APK
       # ============================================================
 
       - name: Build Debug APK
@@ -362,7 +787,11 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          ${{ steps.source.outputs.gradle_cmd }} \
+          echo "=================================================="
+          echo "Building Debug APK"
+          echo "=================================================="
+
+          ${{ steps.project_validation.outputs.gradle_cmd }} \
             --no-daemon \
             --stacktrace \
             --warning-mode all \
@@ -371,7 +800,7 @@ jobs:
             :app:assembleDebug
 
       # ============================================================
-      # 9. Build Release
+      # 15. Build Release APK
       # ============================================================
 
       - name: Build Release APK
@@ -380,7 +809,11 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          ${{ steps.source.outputs.gradle_cmd }} \
+          echo "=================================================="
+          echo "Building Release APK"
+          echo "=================================================="
+
+          ${{ steps.project_validation.outputs.gradle_cmd }} \
             --no-daemon \
             --stacktrace \
             --warning-mode all \
@@ -389,125 +822,244 @@ jobs:
             :app:assembleRelease
 
       # ============================================================
-      # 10. Verify APKs
+      # 16. Find generated APKs
       # ============================================================
 
-      - name: Verify generated APKs
-        id: apk
+      - name: Detect generated APKs
+        id: apks
         shell: bash
         run: |
           set -Eeuo pipefail
 
           project="${{ steps.source.outputs.project }}"
 
-          debug_apk="$(
-            find "$project/app/build/outputs/apk/debug" \
+          echo "=================================================="
+          echo "Searching generated APKs"
+          echo "=================================================="
+
+          mapfile -t apks < <(
+            find "$project/app/build/outputs/apk" \
               -type f \
               -name '*.apk' \
               -print \
-              | head -n1
-          )"
+            | sort
+          )
 
-          release_apk="$(
-            find "$project/app/build/outputs/apk/release" \
+          if [[ "${#apks[@]}" -eq 0 ]]; then
+
+            echo
+            echo "::error::No APK was generated."
+
+            echo
+            echo "Build output tree:"
+
+            find "$project/app/build/outputs" \
+              -maxdepth 6 \
               -type f \
-              -name '*.apk' \
               -print \
-              | head -n1
-          )"
+              | sort \
+              || true
 
-          if [[ -z "${debug_apk:-}" || ! -s "$debug_apk" ]]; then
-            echo "::error::Debug APK was not generated."
             exit 1
+
           fi
-
-          if [[ -z "${release_apk:-}" || ! -s "$release_apk" ]]; then
-            echo "::error::Release APK was not generated."
-            exit 1
-          fi
-
-          echo "=========================================="
-          echo "Generated APKs"
-          echo "=========================================="
-
-          ls -lh "$debug_apk"
-          ls -lh "$release_apk"
 
           echo
-          echo "SHA-256:"
+          echo "Generated APK files:"
 
-          sha256sum "$debug_apk"
-          sha256sum "$release_apk"
+          for apk in "${apks[@]}"; do
+
+            echo
+            ls -lh "$apk"
+
+            echo "SHA-256:"
+            sha256sum "$apk"
+
+          done
+
+          # --------------------------------------------------------
+          # Debug APK
+          # --------------------------------------------------------
+
+          debug_apk="$(
+            find "$project/app/build/outputs/apk" \
+              -type f \
+              -name '*debug*.apk' \
+              -print \
+            | sort \
+            | head -n1
+          )"
+
+          # --------------------------------------------------------
+          # Release APK
+          # --------------------------------------------------------
+
+          release_apk="$(
+            find "$project/app/build/outputs/apk" \
+              -type f \
+              -name '*release*.apk' \
+              -print \
+            | sort \
+            | head -n1
+          )"
+
+          if [[ -z "${debug_apk:-}" ]]; then
+
+            echo
+            echo "::error::Debug APK was not found."
+
+            exit 1
+
+          fi
+
+          if [[ -z "${release_apk:-}" ]]; then
+
+            echo
+            echo "::error::Release APK was not found."
+
+            exit 1
+
+          fi
 
           {
-            echo "debug_apk=$debug_apk"
-            echo "release_apk=$release_apk"
+            echo "debug=$debug_apk"
+            echo "release=$release_apk"
           } >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 11. Copy artifacts to clean folder
+      # 17. Validate APKs with aapt
       # ============================================================
 
-      - name: Prepare APK artifacts
+      - name: Validate APK files
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          out="$RUNNER_TEMP/VocalStudioPro-APKs"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
+          AAPT="$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/aapt"
+
+          if [[ ! -x "$AAPT" ]]; then
+
+            echo "::error::aapt not found:"
+            echo "$AAPT"
+
+            exit 1
+
+          fi
+
+          echo "=================================================="
+          echo "Debug APK"
+          echo "=================================================="
+
+          "$AAPT" dump badging \
+            "${{ steps.apks.outputs.debug }}" \
+            | head -40
+
+          echo
+          echo "=================================================="
+          echo "Release APK"
+          echo "=================================================="
+
+          "$AAPT" dump badging \
+            "${{ steps.apks.outputs.release }}" \
+            | head -40
+
+      # ============================================================
+      # 18. Prepare clean artifact directory
+      # ============================================================
+
+      - name: Prepare final artifacts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          out="$RUNNER_TEMP/VocalStudioPro-v${APP_VERSION}"
 
           rm -rf "$out"
+
           mkdir -p "$out"
 
           cp \
-            "${{ steps.apk.outputs.debug_apk }}" \
-            "$out/VocalStudioPro-v1.1.0-debug.apk"
+            "${{ steps.apks.outputs.debug }}" \
+            "$out/VocalStudioPro-v${APP_VERSION}-debug.apk"
 
           cp \
-            "${{ steps.apk.outputs.release_apk }}" \
-            "$out/VocalStudioPro-v1.1.0-release.apk"
+            "${{ steps.apks.outputs.release }}" \
+            "$out/VocalStudioPro-v${APP_VERSION}-release.apk"
 
-          sha256sum \
-            "$out/VocalStudioPro-v1.1.0-debug.apk" \
-            "$out/VocalStudioPro-v1.1.0-release.apk" \
-            > "$out/SHA256SUMS.txt"
+          cp \
+            "${{ steps.source.outputs.zip }}" \
+            "$out/VocalStudioPro-v${APP_VERSION}-source.zip"
 
-          echo "Prepared artifacts:"
+          (
+            cd "$out"
+
+            sha256sum \
+              "VocalStudioPro-v${APP_VERSION}-debug.apk" \
+              "VocalStudioPro-v${APP_VERSION}-release.apk" \
+              "VocalStudioPro-v${APP_VERSION}-source.zip" \
+              > SHA256SUMS.txt
+          )
+
+          echo
+          echo "=================================================="
+          echo "Final artifacts"
+          echo "=================================================="
+
           ls -lah "$out"
 
+          echo
+          echo "SHA256SUMS:"
+          cat "$out/SHA256SUMS.txt"
+
       # ============================================================
-      # 12. Upload Debug APK
+      # 19. Upload Debug
       # ============================================================
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: VocalStudioPro-v1.1.0-Debug
-          path: ${{ runner.temp }}/VocalStudioPro-APKs/VocalStudioPro-v1.1.0-debug.apk
+          path: ${{ runner.temp }}/VocalStudioPro-v1.1.0/VocalStudioPro-v1.1.0-debug.apk
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
 
       # ============================================================
-      # 13. Upload Release APK
+      # 20. Upload Release
       # ============================================================
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: VocalStudioPro-v1.1.0-Release
-          path: ${{ runner.temp }}/VocalStudioPro-APKs/VocalStudioPro-v1.1.0-release.apk
+          path: ${{ runner.temp }}/VocalStudioPro-v1.1.0/VocalStudioPro-v1.1.0-release.apk
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
 
       # ============================================================
-      # 14. Upload checksums
+      # 21. Upload Source
       # ============================================================
 
-      - name: Upload SHA256 checksums
+      - name: Upload source ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: VocalStudioPro-v1.1.0-Source
+          path: ${{ runner.temp }}/VocalStudioPro-v1.1.0/VocalStudioPro-v1.1.0-source.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      # ============================================================
+      # 22. Upload SHA256
+      # ============================================================
+
+      - name: Upload checksums
         uses: actions/upload-artifact@v4
         with:
           name: VocalStudioPro-v1.1.0-SHA256
-          path: ${{ runner.temp }}/VocalStudioPro-APKs/SHA256SUMS.txt
+          path: ${{ runner.temp }}/VocalStudioPro-v1.1.0/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
