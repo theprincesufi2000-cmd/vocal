@@ -1,0 +1,97 @@
+name: Build VocalStudioPro from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'VocalStudioPro-Native-AutoTune-Source-v1.0.1.zip'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-37' \
+            'build-tools;36.0.0' \
+            'ndk;28.2.13676358' \
+            'cmake;3.22.1'
+
+      - name: Setup Gradle 9.6
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.0'
+
+      - name: Extract and validate project
+        id: src
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          zip='VocalStudioPro-Native-AutoTune-Source-v1.0.1.zip'
+          test -s "$zip"
+          work="$RUNNER_TEMP/vocalstudiopro"
+          rm -rf "$work" && mkdir -p "$work"
+          unzip -q "$zip" -d "$work"
+          settings="$(find "$work" -type f -name settings.gradle.kts -print -quit)"
+          test -n "$settings"
+          project="$(dirname "$settings")"
+          test -s "$project/app/build.gradle.kts"
+          test -s "$project/app/src/main/cpp/CMakeLists.txt"
+          grep -Fq 'versionName = "1.0.1"' "$project/app/build.gradle.kts"
+          grep -Fq 'lifecycle-viewmodel-compose:2.11.0' "$project/app/build.gradle.kts"
+          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
+
+      - name: Build Debug and Release
+        shell: bash
+        env:
+          PROJECT: ${{ steps.src.outputs.project }}
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT"
+          gradle --no-daemon --console=plain --stacktrace --max-workers=2 :app:assembleDebug :app:assembleRelease
+
+      - name: Stage installable APK and reports
+        shell: bash
+        env:
+          PROJECT: ${{ steps.src.outputs.project }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+          debug_apk="$(find "$PROJECT/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
+          test -n "$debug_apk"
+          cp "$debug_apk" dist/VocalStudioPro-v1.0.1-Debug.apk
+          release_apk="$(find "$PROJECT/app/build/outputs/apk/release" -type f -name '*.apk' -print -quit || true)"
+          if [ -n "$release_apk" ]; then cp "$release_apk" dist/VocalStudioPro-v1.0.1-Release-Unsigned.apk; fi
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/VocalStudioPro-v1.0.1-Debug.apk > dist/APK-INFO.txt
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs dist/VocalStudioPro-v1.0.1-Debug.apk > dist/SIGNATURE-INFO.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VocalStudioPro-v1.0.1-APKs
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
