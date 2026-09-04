@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'VocalStudioPro-Native-AutoTune-Source-v1.0.1.zip'
+      - 'VocalStudioPro-Native-AutoTune-Source-v1.0.1-1.zip'
       - '.github/workflows/build.yml'
 
 permissions:
