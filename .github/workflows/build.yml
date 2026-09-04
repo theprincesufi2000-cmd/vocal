@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'VocalStudioPro-Native-AutoTune-Source-v1.0.1-1.zip'
+      - 'VocalStudioPro-Native-AutoTune-Source-v1.0.1*.zip'
       - '.github/workflows/build.yml'
 
 permissions:
@@ -32,10 +32,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Avoid harmless "yes: Broken pipe" noise after sdkmanager closes stdin.
           yes 2>/dev/null | sdkmanager --licenses >/dev/null 2>&1 || true
 
-          # Android 17 / API 37 is published as the minor-versioned package android-37.0.
           sdkmanager --channel=3 \
             'platform-tools' \
             'platforms;android-37.0' \
@@ -43,11 +41,20 @@ jobs:
             'ndk;28.2.13676358' \
             'cmake;3.22.1'
 
-          test -s "$ANDROID_HOME/platforms/android-37.0/android.jar"
-          test -x "$ANDROID_HOME/build-tools/37.0.0/aapt"
-          test -x "$ANDROID_HOME/build-tools/37.0.0/apksigner"
-          test -d "$ANDROID_HOME/ndk/28.2.13676358"
-          test -x "$ANDROID_HOME/cmake/3.22.1/bin/cmake"
+          for f in \
+            "$ANDROID_HOME/platforms/android-37.0/android.jar" \
+            "$ANDROID_HOME/build-tools/37.0.0/aapt" \
+            "$ANDROID_HOME/build-tools/37.0.0/apksigner" \
+            "$ANDROID_HOME/cmake/3.22.1/bin/cmake"; do
+            if [[ ! -e "$f" ]]; then
+              echo "::error::Android toolchain file missing: $f"
+              exit 1
+            fi
+          done
+          [[ -d "$ANDROID_HOME/ndk/28.2.13676358" ]] || {
+            echo "::error::NDK 28.2.13676358 was not installed"
+            exit 1
+          }
 
       - name: Setup Gradle 9.6
         uses: gradle/actions/setup-gradle@v4
@@ -59,8 +66,24 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          zip='VocalStudioPro-Native-AutoTune-Source-v1.0.1.zip'
-          test -s "$zip"
+
+          preferred="$GITHUB_WORKSPACE/VocalStudioPro-Native-AutoTune-Source-v1.0.1-CI-Fixed.zip"
+          if [[ -s "$preferred" ]]; then
+            zip="$preferred"
+          else
+            zip="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
+              -name 'VocalStudioPro-Native-AutoTune-Source-v1.0.1*.zip' \
+              -print | sort -V | head -n1 || true)"
+          fi
+
+          if [[ -z "${zip:-}" || ! -s "$zip" ]]; then
+            echo "::error::VocalStudioPro source ZIP not found in repository root."
+            echo "Repository root contents:"
+            ls -lah "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+          echo "Using source ZIP: $(basename "$zip")"
+          unzip -tq "$zip"
 
           work="$RUNNER_TEMP/vocalstudiopro"
           rm -rf "$work"
@@ -68,18 +91,46 @@ jobs:
           unzip -q "$zip" -d "$work"
 
           settings="$(find "$work" -type f -name settings.gradle.kts -print -quit)"
-          test -n "$settings"
+          if [[ -z "$settings" ]]; then
+            echo "::error::settings.gradle.kts not found after extracting source ZIP."
+            find "$work" -maxdepth 4 -type f -print | sort | head -200
+            exit 1
+          fi
           project="$(dirname "$settings")"
+          echo "Detected project root: $project"
 
-          test -s "$project/build.gradle.kts"
-          test -s "$project/app/build.gradle.kts"
-          test -s "$project/app/src/main/cpp/CMakeLists.txt"
-          grep -Fq 'compileSdk = 37' "$project/app/build.gradle.kts"
-          grep -Fq 'targetSdk = 37' "$project/app/build.gradle.kts"
-          grep -Fq 'versionName = "1.0.1"' "$project/app/build.gradle.kts"
-          grep -Fq 'lifecycle-viewmodel-compose:2.11.0' "$project/app/build.gradle.kts"
+          require_file() {
+            local f="$1"
+            [[ -s "$f" ]] || {
+              echo "::error::Required project file missing or empty: ${f#$project/}"
+              exit 1
+            }
+            echo "OK file: ${f#$project/}"
+          }
+
+          require_text() {
+            local f="$1" text="$2" label="$3"
+            if ! grep -Fq -- "$text" "$f"; then
+              echo "::error::$label was not found in ${f#$project/}"
+              echo "Expected: $text"
+              echo "Relevant file contents:"
+              sed -n '1,180p' "$f"
+              exit 1
+            fi
+            echo "OK: $label"
+          }
+
+          require_file "$project/build.gradle.kts"
+          require_file "$project/app/build.gradle.kts"
+          require_file "$project/app/src/main/cpp/CMakeLists.txt"
+
+          require_text "$project/app/build.gradle.kts" 'compileSdk = 37' 'compileSdk 37'
+          require_text "$project/app/build.gradle.kts" 'targetSdk = 37' 'targetSdk 37'
+          require_text "$project/app/build.gradle.kts" 'versionName = "1.0.1"' 'versionName 1.0.1'
+          require_text "$project/app/build.gradle.kts" 'lifecycle-viewmodel-compose:2.11.0' 'Lifecycle ViewModel Compose 2.11.0'
 
           printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
+          printf 'source_zip=%s\n' "$zip" >> "$GITHUB_OUTPUT"
 
       - name: Build Debug and Release
         shell: bash
@@ -88,6 +139,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd "$PROJECT"
+          gradle --version
           gradle \
             --no-daemon \
             --console=plain \
@@ -96,20 +148,25 @@ jobs:
             :app:assembleDebug \
             :app:assembleRelease
 
-      - name: Stage installable APK and reports
+      - name: Stage APKs and verification reports
         shell: bash
         env:
           PROJECT: ${{ steps.src.outputs.project }}
         run: |
           set -Eeuo pipefail
+          rm -rf dist
           mkdir -p dist
 
-          debug_apk="$(find "$PROJECT/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
-          test -n "$debug_apk"
+          debug_apk="$(find "$PROJECT/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit || true)"
+          if [[ -z "$debug_apk" ]]; then
+            echo "::error::Debug APK was not produced"
+            find "$PROJECT/app/build/outputs" -maxdepth 5 -type f -print 2>/dev/null || true
+            exit 1
+          fi
           cp "$debug_apk" dist/VocalStudioPro-v1.0.1-Debug.apk
 
           release_apk="$(find "$PROJECT/app/build/outputs/apk/release" -type f -name '*.apk' -print -quit || true)"
-          if [ -n "$release_apk" ]; then
+          if [[ -n "$release_apk" ]]; then
             cp "$release_apk" dist/VocalStudioPro-v1.0.1-Release-Unsigned.apk
           fi
 
@@ -118,6 +175,9 @@ jobs:
             dist/VocalStudioPro-v1.0.1-Debug.apk > dist/APK-INFO.txt
           "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs \
             dist/VocalStudioPro-v1.0.1-Debug.apk > dist/SIGNATURE-INFO.txt
+
+          echo 'Produced files:'
+          ls -lh dist
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
